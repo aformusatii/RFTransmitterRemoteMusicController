@@ -45,7 +45,6 @@ void goToSleep();
 /********************************************************************************
 	Global Variables
 ********************************************************************************/
-volatile uint8_t vol = 0;
 volatile uint8_t button = 0;
 volatile uint8_t last_channel = 110;
 
@@ -56,6 +55,7 @@ bool ir_preamble_detected = false;
 bool awake = true;
 bool rfAwake = false;
 bool volChanged = false;
+bool volUp = false;
 
 /********************************************************************************
 	Interrupt Service
@@ -77,14 +77,10 @@ ISR(INT0_vect)
 
     uint8_t port = PINC & 0b00110000; // mask for PC5 & PC4
     if (port == 0b00010000) {
-    	if (vol != 255) {
-    		vol+=5;
-    	}
+    	volUp = true;
     	volChanged = true;
     } else if (port == 0b00100000) {
-    	if (vol != 0) {
-        	vol-=5;
-    	}
+    	volUp = false;
     	volChanged = true;
     }
 }
@@ -286,8 +282,7 @@ void handleButton() {
 	}
 
 	if (volChanged) {
-		sendToChannel(116, 102, vol);
-		//printf("\n vol = %d", vol);
+		sendToChannel(116, volUp ? 100 : 101);
 	}
 
 	volChanged = false;

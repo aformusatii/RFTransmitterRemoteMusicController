@@ -282,7 +282,7 @@ void handleButton() {
 	}
 
 	if (volChanged) {
-		sendToChannel(116, volUp ? 100 : 101);
+		sendToChannel(125, volUp ? 100 : 101);
 	}
 
 	volChanged = false;

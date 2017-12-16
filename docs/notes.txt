@@ -1,0 +1,5 @@
+Brown out detection - off
+idle current = ~7 ua (0.006 ma)
+ 
+Brown out detection - ON 1.7v
+idle current = 0.023 ma

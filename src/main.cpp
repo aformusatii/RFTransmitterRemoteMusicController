@@ -21,15 +21,23 @@ extern "C" {
 /********************************************************************************
 	Macros and Defines
 ********************************************************************************/
-#define BT_PAUSE         0 // PC0
-#define BT_PREV          1 // PC1
-#define BT_PLAY          2 // PC2
-#define BT_PREV_PLAYLIST 3 // PC3
-#define BT_NEXT_PLAYLIST 4 // PB0
-#define BT_STOP          5 // PD7
-#define BT_NEXT          6 // PD6
+#define PI_TWO_CHANNEL   110
+#define SENSOR_DATA_KEY  100 // PI TWO knows this is sensor data and not a command
+#define SENSOR_ID        6   // current sensor identifier for PI Database
+#define EVENT_BATTERY    4   // sensor battery event stored in database
+#define EVENT_START      5   // Start MCU event
 
+#define BT_PAUSE         PD4 // PD4
+#define BT_PREV          PC1 // PC1
+#define BT_PLAY          PC2 // PC2
+#define BT_PREV_PLAYLIST PC3 // PC3
+#define BT_NEXT_PLAYLIST PB0 // PB0
+#define BT_STOP          PD7 // PD7
+#define BT_NEXT          PD6 // PD6
 
+#define VOLUME_MAX   79
+
+#define VOLATAGE_COEFFICIENT 4.48 // 1.9v -> 425, 2.0v -> 448, 2.5 -> 560, 3.1 -> 668
 
 /********************************************************************************
 	Function Prototypes
@@ -40,22 +48,34 @@ void powerDownRF();
 void handleButton();
 void sendToChannel(uint8_t channel, uint8_t data);
 void sendToChannel(uint8_t channel, uint8_t data1, uint8_t data2);
+void sendToChannel(uint8_t event, uint8_t channel, uint8_t data_high, uint8_t data_low);
 void goToSleep();
+void measureAndSendBatteryLevel();
+uint16_t adc_read(uint8_t adcx);
 
 /********************************************************************************
 	Global Variables
 ********************************************************************************/
-volatile uint8_t button = 0;
-volatile uint8_t last_channel = 110;
+volatile uint8_t last_channel = PI_TWO_CHANNEL;
+volatile uint8_t volume = 0;
 
 RF24 radio;
 const uint64_t pipes[2] = { 0xF0F0F0F0E1LL, 0xF0F0F0F0D2LL };
 
-bool ir_preamble_detected = false;
-bool awake = true;
-bool rfAwake = false;
-bool volChanged = false;
-bool volUp = false;
+volatile bool ir_preamble_detected = false;
+volatile bool awake = true;
+volatile bool rfAwake = false;
+volatile bool volChanged = false;
+volatile bool volUp = false;
+volatile bool btPress = false;
+
+volatile bool pausePress = false;
+volatile bool prevPress = false;
+volatile bool playPress = false;
+volatile bool prevPlaylistPress = false;
+volatile bool nextPlaylistPress = false;
+volatile bool stopPress = false;
+volatile bool nextPress = false;
 
 /********************************************************************************
 	Interrupt Service
@@ -90,23 +110,19 @@ ISR(INT1_vect)
 	// Keep the processor awake
     awake = true;
 
-    uint8_t port1 = ~PINB;
-    uint8_t port2 = ~PINC;
-    uint8_t port3 = ~PIND;
+    uint8_t portB = ~PINB;
+    uint8_t portC = ~PINC;
+    uint8_t portD = ~PIND;
 
-    button = (port2 & 0b00001111); // mask for PC0 - PC3
+    pausePress =        GET_REG1_FLAG(portD, BT_PAUSE);
+    prevPress =         GET_REG1_FLAG(portC, BT_PREV);
+    playPress =         GET_REG1_FLAG(portC, BT_PLAY);
+    prevPlaylistPress = GET_REG1_FLAG(portC, BT_PREV_PLAYLIST);
+    nextPlaylistPress = GET_REG1_FLAG(portB, BT_NEXT_PLAYLIST);
+    stopPress =         GET_REG1_FLAG(portD, BT_STOP);
+    nextPress =         GET_REG1_FLAG(portD, BT_NEXT);
 
-    if (GET_REG1_FLAG(port1, PB0)) {
-    	SET_REG1_FLAG(button, BT_NEXT_PLAYLIST);
-    }
-
-    if (GET_REG1_FLAG(port3, PD6)) {
-    	SET_REG1_FLAG(button, BT_NEXT);
-    }
-
-    if (GET_REG1_FLAG(port3, PD7)) {
-    	SET_REG1_FLAG(button, BT_STOP);
-    }
+    btPress = true;
 }
 
 ISR(TIMER2_OVF_vect)
@@ -118,11 +134,12 @@ ISR(TIMER2_OVF_vect)
 	Main
 ********************************************************************************/
 int main(void) {
+
     // initialize usart module
 	usart_init();
 
     // Init Timer 1
-    initTimer();
+    //initTimer();
 
     // Init GPIO
     initGPIO();
@@ -150,6 +167,8 @@ int main(void) {
     // Some RF module diagnostics logs
     radio.printDetails();
 
+    sendToChannel(PI_TWO_CHANNEL, EVENT_START, 0, 0);
+
 	// main loop
     while (1) {
     	// main usart loop for console
@@ -157,7 +176,20 @@ int main(void) {
 
     	if (awake) {
     		awake = false;
+
+    	    // Wake up the RF module
+    	    powerOnRF();
+
     		handleButton();
+
+    		if (btPress) {
+    			btPress = false;
+
+    			_delay_ms(100);
+
+    			measureAndSendBatteryLevel();
+    		}
+
     	} else {
     		// Can we sleep? we are hungry when awake...
     		goToSleep();
@@ -170,26 +202,34 @@ int main(void) {
 ********************************************************************************/
 void initGPIO() {
 
-	_in(DDD7, DDRD);
-	_in(DDD6, DDRD);
-	_in(DDB0, DDRB);
-	_in(DDC3, DDRC);
-	_in(DDC2, DDRC);
-	_in(DDC1, DDRC);
-	_in(DDC0, DDRC);
+	_in(DDD4, DDRD); // BT_PAUSE
+	_on(PD4, PIND); // Pull-up
 
-	_on(PD7, PIND); // Pull-up
-	_on(PD6, PIND); // Pull-up
-	_on(PB0, PINB); // Pull-up
-	_on(PC3, PINC); // Pull-up
-	_on(PC2, PINC); // Pull-up
+	_in(DDC1, DDRC); // BT_PREV
 	_on(PC1, PINC); // Pull-up
-	_on(PC0, PINC); // Pull-up
+
+	_in(DDC2, DDRC); // BT_PLAY
+	_on(PC2, PINC); // Pull-up
+
+	_in(DDC3, DDRC); // BT_PREV_PLAYLIST
+	_on(PC3, PINC); // Pull-up
+
+	_in(DDB0, DDRB); // BT_NEXT_PLAYLIST
+	_on(PB0, PINB); // Pull-up
+
+	_in(DDD7, DDRD); // BT_STOP
+	_on(PD7, PIND); // Pull-up
+
+	_in(DDD6, DDRD); // BT_NEXT
+	_on(PD6, PIND); // Pull-up
+
+	_in(DDC0, DDRC); // Battery voltage - analog in
+	// _on(PC0, PINC); // Pull-up
 
 	_in(DDC4, DDRC); // Rotary Encoder A
-	_in(DDC5, DDRC); // Rotary Encoder B
+	_on(PC4, PINC); // Pull-up
 
-    _on(PC4, PINC); // Pull-up
+	_in(DDC5, DDRC); // Rotary Encoder B
     _on(PC5, PINC); // Pull-up
 
     _in(DDD2, DDRD); // INT0 input
@@ -205,6 +245,9 @@ void initGPIO() {
 
 void powerOnRF() {
     if (!rfAwake) {
+    	_out(SPI_CE, DDRB); // CE - power issue
+        _out(DDB5, DDRB); // SCK - power issue
+
         radio.powerUp();
         rfAwake = true;
     }
@@ -215,6 +258,9 @@ void powerDownRF() {
     radio.stopListening();
     radio.powerDown();
     rfAwake = false;
+
+    _in(SPI_CE, DDRB); // CE - power issue
+    _in(DDB5, DDRB); // SCK - power issue
 }
 
 void sendToChannel(uint8_t channel, uint8_t data) {
@@ -241,52 +287,72 @@ void sendToChannel(uint8_t channel, uint8_t data1, uint8_t data2) {
     radio.write(buf, 2);
 }
 
+void sendToChannel(uint8_t channel, uint8_t event, uint8_t data_high, uint8_t data_low) {
+	// change channel if necessary
+	if (channel != last_channel) {
+		last_channel = channel;
+		radio.setChannel(channel);
+	}
+
+    uint8_t data[] = { SENSOR_DATA_KEY, SENSOR_ID, event, data_high, data_low };
+    radio.write(data, 5);
+}
+
 void handleButton() {
 
-    // Wake up the RF module
-    powerOnRF();
-
-	if (GET_REG1_FLAG(button, BT_PAUSE)) {
-		sendToChannel(110, 23);
-		//printf("\n BT_PAUSE");
+	if (pausePress) {
+		sendToChannel(PI_TWO_CHANNEL, 23);
 	}
 
-	if (GET_REG1_FLAG(button, BT_PREV)) {
-		sendToChannel(110, 28);
-		//printf("\n BT_PREV");
+	if (prevPress) {
+		sendToChannel(PI_TWO_CHANNEL, 28);
 	}
 
-	if (GET_REG1_FLAG(button, BT_PLAY)) {
-		sendToChannel(110, 21);
-		//printf("\n BT_PLAY");
+	if (playPress) {
+		sendToChannel(PI_TWO_CHANNEL, 21);
 	}
 
-	if (GET_REG1_FLAG(button, BT_PREV_PLAYLIST)) {
-		sendToChannel(110, 100);
-		//printf("\n BT_PREV_PLAYLIST");
+	if (prevPlaylistPress) {
+		sendToChannel(PI_TWO_CHANNEL, 101);
 	}
 
-	if (GET_REG1_FLAG(button, BT_NEXT_PLAYLIST)) {
-		sendToChannel(110, 101);
-		//printf("\n BT_NEXT_PLAYLIST");
+	if (nextPlaylistPress) {
+		sendToChannel(PI_TWO_CHANNEL, 102);
 	}
 
-	if (GET_REG1_FLAG(button, BT_STOP)) {
-		sendToChannel(110, 20);
-		//printf("\n BT_STOP");
+	if (stopPress) {
+		sendToChannel(PI_TWO_CHANNEL, 103);
 	}
 
-	if (GET_REG1_FLAG(button, BT_NEXT)) {
-		sendToChannel(110, 27);
-		//printf("\n BT_NEXT");
+	if (nextPress) {
+		sendToChannel(PI_TWO_CHANNEL, 27);
 	}
 
 	if (volChanged) {
-		sendToChannel(125, volUp ? 100 : 101);
+		//sendToChannel(124, volUp ? 100 : 101);
+		if (volUp) {
+	    	if (volume > 1) {
+	    		volume -= 2;
+	    	}
+		} else {
+			if (volume < VOLUME_MAX) {
+				volume += 2;
+			}
+		}
+		sendToChannel(124, 102, volume);
 	}
 
+    pausePress =        false;
+    prevPress =         false;
+    playPress =         false;
+    prevPlaylistPress = false;
+    nextPlaylistPress = false;
+    stopPress =         false;
+    nextPress =         false;
+
 	volChanged = false;
-	button = 0;
+
+	_delay_ms(10);
 }
 
 void goToSleep() {
@@ -300,6 +366,54 @@ void goToSleep() {
 	sleep_mode();
 
 	//printf("\n wake...");
+}
+
+void measureAndSendBatteryLevel() {
+	_on(PC0, PORTC); // enable pull-up resistor for ADC battery level
+	_delay_ms(1); // wait voltage to raise
+
+    ADCSRA |= _BV(ADEN); // Enable the ADC
+    _delay_ms(5);
+
+    uint16_t mux0Value = adc_read(MUX0);
+
+    uint16_t voltage = (uint16_t) ( (( ((uint32_t)mux0Value) * 100) * (VOLATAGE_COEFFICIENT * 100)) / 10000 );
+
+    uint8_t b_low = (uint8_t) voltage;
+    uint8_t b_high = (uint8_t) (voltage >> 8);
+
+    // Send battery level via NRF24L01 transceiver
+    sendToChannel(PI_TWO_CHANNEL, EVENT_BATTERY, b_high, b_low);
+
+    ADCSRA &= ~_BV(ADEN); // Disable ADC
+
+	_off(PC0, PORTC); // disable pull-up resistor for ADC battery level
+}
+
+uint16_t adc_read(uint8_t adcx) {
+    /* adcx is the analog pin we want to use.  ADMUX's first few bits are
+     * the binary representations of the numbers of the pins so we can
+     * just 'OR' the pin's number with ADMUX to select that pin.
+     * We first zero the four bits by setting ADMUX equal to its higher
+     * four bits. */
+    ADMUX = adcx;
+    ADMUX |= (1 << REFS1) | (1 << REFS0) | (0 << ADLAR);
+
+    _delay_us(300);
+
+    /* This starts the conversion. */
+    ADCSRA |= _BV(ADSC);
+
+    /* This is an idle loop that just wait around until the conversion
+     * is finished.  It constantly checks ADCSRA's ADSC bit, which we just
+     * set above, to see if it is still set.  This bit is automatically
+     * reset (zeroed) when the conversion is ready so if we do this in
+     * a loop the loop will just go until the conversion is ready. */
+    while ((ADCSRA & _BV(ADSC)))
+        ;
+
+    /* Finally, we return the converted value to the calling function. */
+    return ADC;
 }
 
 void handle_usart_cmd(char *cmd, char *args) {
